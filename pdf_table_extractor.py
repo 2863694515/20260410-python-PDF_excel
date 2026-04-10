@@ -28,8 +28,8 @@ import pdfplumber
 # ============================================================
 # 用户配置（请按需修改）
 # ============================================================
-PDF_INPUT_PATH = r"D:\A_Projects_MQ\20260410-python-PDF_excel\500 2.pdf"
-EXCEL_OUTPUT_PATH = r"D:\A_Projects_MQ\20260410-python-PDF_excel\output.xlsx"
+PDF_INPUT_PATH = r"150 2.pdf"
+EXCEL_OUTPUT_PATH = r"output1.xlsx"
 
 TABLE1_PAGE_RANGE = (1, 2)  # 页 1-2 -> table_1
 TABLE2_PAGE_RANGE = (3, 4)  # 页 3-4 -> table_2
