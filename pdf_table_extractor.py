@@ -556,39 +556,108 @@ def refine_table2(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     blobs = collect_row_blobs(df)
-    longest_nums: List[str] = []
+    def build_output(rows: List[tuple[str, str, str, str]]) -> pd.DataFrame:
+        out_local = pd.DataFrame(
+            rows,
+            columns=["样本编号", "Mitl_Steigung_Taster N/mm", "Dehn. Fmax Taster mm", "F_max N"],
+        )
+        out_local["Mitl_Steigung_Taster N/mm"] = pd.to_numeric(out_local["Mitl_Steigung_Taster N/mm"], errors="coerce")
+        out_local["Dehn. Fmax Taster mm"] = pd.to_numeric(out_local["Dehn. Fmax Taster mm"], errors="coerce")
+        out_local["F_max N"] = pd.to_numeric(out_local["F_max N"], errors="coerce")
+        out_local = out_local.dropna(
+            how="all", subset=["Mitl_Steigung_Taster N/mm", "Dehn. Fmax Taster mm", "F_max N"]
+        )
+        return out_local.reset_index(drop=True)
+
+    def score_candidate(out_local: pd.DataFrame) -> int:
+        if out_local.empty:
+            return -1
+        c1 = out_local["Mitl_Steigung_Taster N/mm"]
+        c2 = out_local["Dehn. Fmax Taster mm"]
+        c3 = out_local["F_max N"]
+
+        score = 0
+        if c1.notna().mean() >= 0.9:
+            score += 1
+        if c2.notna().mean() >= 0.9:
+            score += 1
+        if c3.notna().mean() >= 0.9:
+            score += 1
+
+        # table_2 的典型值域：Steigung 较大、Dehn 较小、F_max 约数百
+        if c1.median(skipna=True) > 1000:
+            score += 2
+        if 0 < c2.median(skipna=True) < 10:
+            score += 3
+        if c2.median(skipna=True) >= 100:
+            score -= 6
+        if c3.median(skipna=True) > 100:
+            score += 2
+
+        return score
+
+    candidates: List[tuple[int, int, pd.DataFrame]] = []
+
+    # 关键修复：每个 blob 独立解析，避免跨 blob 拼接造成列错位。
     for b in blobs:
         nums = NUM_PATTERN.findall(b)
-        if len(nums) > len(longest_nums):
-            longest_nums = nums
+        if len(nums) < 9:
+            continue
 
-    if len(longest_nums) < 9:
-        # 兜底：拼接全部数值
-        longest_nums = []
-        for b in blobs:
-            longest_nums.extend(NUM_PATTERN.findall(b))
+        # 模式1：交错模式（每 3 个数值为一条记录）
+        inter_rows: List[tuple[str, str, str, str]] = []
+        usable = (len(nums) // 3) * 3
+        if usable >= 9:
+            for i in range(0, usable, 3):
+                inter_rows.append((str(i // 3 + 1), nums[i], nums[i + 1], nums[i + 2]))
+            out_inter = build_output(inter_rows)
+            candidates.append((score_candidate(out_inter), len(out_inter), out_inter))
 
-    if len(longest_nums) < 3:
+        # 模式2：块模式（前1/3, 中1/3, 后1/3 分别为三列）
+        if usable >= 9:
+            n = usable // 3
+            seq1 = nums[0:n]
+            seq2 = nums[n : 2 * n]
+            seq3 = nums[2 * n : 3 * n]
+            block_rows = [(str(i + 1), seq1[i], seq2[i], seq3[i]) for i in range(n)]
+            out_block = build_output(block_rows)
+            candidates.append((score_candidate(out_block), len(out_block), out_block))
+
+    if not candidates:
         return df
 
-    usable = (len(longest_nums) // 3) * 3
-    nums = longest_nums[:usable]
+    # 先过滤低质量候选，再合并去重，保留所有有效段。
+    def looks_like_table2(out_local: pd.DataFrame) -> bool:
+        if out_local.empty or len(out_local) < 5:
+            return False
+        c1 = out_local["Mitl_Steigung_Taster N/mm"]
+        c2 = out_local["Dehn. Fmax Taster mm"]
+        c3 = out_local["F_max N"]
 
-    rows = []
-    for i in range(0, len(nums), 3):
-        rows.append((str(i // 3 + 1), nums[i], nums[i + 1], nums[i + 2]))
+        c1_med = c1.median(skipna=True)
+        c2_med = c2.median(skipna=True)
+        c3_med = c3.median(skipna=True)
+        c2_q90 = c2.quantile(0.9)
 
-    out = pd.DataFrame(
-        rows,
-        columns=["样本编号", "Mitl_Steigung_Taster N/mm", "Dehn. Fmax Taster mm", "F_max N"],
-    )
+        return (
+            c1_med > 100
+            and 0 < c2_med < 10
+            and c2_q90 < 10
+            and c3_med > 100
+        )
 
-    out["Mitl_Steigung_Taster N/mm"] = pd.to_numeric(out["Mitl_Steigung_Taster N/mm"], errors="coerce")
-    out["Dehn. Fmax Taster mm"] = pd.to_numeric(out["Dehn. Fmax Taster mm"], errors="coerce")
-    out["F_max N"] = pd.to_numeric(out["F_max N"], errors="coerce")
-    out = out.dropna(how="all", subset=["Mitl_Steigung_Taster N/mm", "Dehn. Fmax Taster mm", "F_max N"])
+    good = [c for c in candidates if c[0] >= 6 and looks_like_table2(c[2])]
+    if not good:
+        good = sorted(candidates, key=lambda x: (x[0], x[1]), reverse=True)[:1]
 
-    return out.reset_index(drop=True)
+    merged = pd.concat([c[2] for c in good], axis=0, ignore_index=True)
+    merged = merged.drop_duplicates(
+        subset=["Mitl_Steigung_Taster N/mm", "Dehn. Fmax Taster mm", "F_max N"], keep="first"
+    ).reset_index(drop=True)
+
+    merged["样本编号"] = [str(i + 1) for i in range(len(merged))]
+    merged = merged[["样本编号", "Mitl_Steigung_Taster N/mm", "Dehn. Fmax Taster mm", "F_max N"]]
+    return merged
 
 
 def finalize_tables(table1: pd.DataFrame, table2: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
