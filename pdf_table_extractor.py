@@ -28,7 +28,7 @@ import pdfplumber
 # ============================================================
 # 用户配置（请按需修改）
 # ============================================================
-PDF_INPUT_PATH = r"D:\A_Projects_MQ\20260410-python-PDF_excel\150 2.pdf"
+PDF_INPUT_PATH = r"D:\A_Projects_MQ\20260410-python-PDF_excel\500 2.pdf"
 EXCEL_OUTPUT_PATH = r"D:\A_Projects_MQ\20260410-python-PDF_excel\output.xlsx"
 
 TABLE1_PAGE_RANGE = (1, 2)  # 页 1-2 -> table_1
@@ -430,7 +430,34 @@ def collect_row_blobs(df: pd.DataFrame) -> List[str]:
 
 
 def is_number_token(token: str) -> bool:
-    return NUM_PATTERN.fullmatch(token) is not None
+    return parse_numeric_token(token) is not None
+
+
+def parse_numeric_token(token: str) -> Optional[str]:
+    """提取数值 token，兼容 <219.42 / >10.5 / <=3.2，并保留不等号前缀。"""
+    tk = normalize_cell(token)
+    if not tk:
+        return None
+    tk = tk.replace(",", "")
+    m = re.fullmatch(r"(<=|>=|<|>)?\s*([-+]?\d+(?:\.\d+)?)", tk)
+    if not m:
+        return None
+    op = m.group(1) or ""
+    num = m.group(2)
+    return f"{op}{num}"
+
+
+def to_measure_value(value: object) -> object:
+    """测量值标准化：保留不等号值为文本，其余尽量转为数值。"""
+    tk = normalize_cell(value)
+    if not tk:
+        return pd.NA
+    parsed = parse_numeric_token(tk)
+    if parsed is None:
+        return tk
+    if parsed.startswith(("<", ">", "<=", ">=")):
+        return parsed
+    return pd.to_numeric(parsed, errors="coerce")
 
 
 def parse_table1_blob(blob: str) -> List[tuple[str, str, str, str, str]]:
@@ -451,8 +478,24 @@ def parse_table1_blob(blob: str) -> List[tuple[str, str, str, str, str]]:
             break
 
     if first_id_idx is not None and first_id_idx > 0:
+        stopwords = {
+            "---",
+            "Bezeichnung",
+            "Probe",
+            "N/mm",
+            "F_min",
+            "min",
+            "max",
+            "标注",
+            "Minimale",
+            "Steifigkeit",
+            "auf",
+            "ab",
+            "N",
+            "mm",
+        }
         for tk in tokens[:first_id_idx]:
-            if tk and not is_number_token(tk) and tk not in {"---", "Bezeichnung", "Probe", "N/mm", "F_min", "min", "max", "标注"}:
+            if tk and not is_number_token(tk) and tk not in stopwords:
                 bezeichnung = tk
                 break
 
@@ -469,11 +512,17 @@ def parse_table1_blob(blob: str) -> List[tuple[str, str, str, str, str]]:
                 t2 = tokens[j]
                 if SAMPLE_ID_PATTERN.fullmatch(t2):
                     break
-                if is_number_token(t2):
-                    nums.append(t2)
+                num = parse_numeric_token(t2)
+                if num is not None:
+                    nums.append(num)
                 j += 1
             if len(nums) == 3:
                 records.append((bezeichnung, sid, nums[0], nums[1], nums[2]))
+                i = j
+                continue
+            if len(nums) == 2:
+                # 新模板里常见：Probe + 2个数值（"auf" 缺失），保留为缺失值。
+                records.append((bezeichnung, sid, "", nums[0], nums[1]))
                 i = j
                 continue
         i += 1
@@ -489,7 +538,13 @@ def parse_table1_blob(blob: str) -> List[tuple[str, str, str, str, str]]:
                     ids.append(sid)
                     seen.add(sid)
 
-            num_tokens = [t for t in tokens if is_number_token(t)]
+            # 从首个样本编号之后提取数值，避免页眉中的 450.00 污染。
+            num_tokens = []
+            start_from = first_id_idx + 1 if first_id_idx is not None else 0
+            for t in tokens[start_from:]:
+                num = parse_numeric_token(t)
+                if num is not None:
+                    num_tokens.append(num)
             n_ids = len(ids)
             needed = 3 * n_ids
             if len(num_tokens) >= needed:
@@ -500,6 +555,17 @@ def parse_table1_blob(blob: str) -> List[tuple[str, str, str, str, str]]:
                 block_records = [
                     (bezeichnung, sid, v1, v2, v3)
                     for sid, v1, v2, v3 in zip(ids, col1, col2, col3)
+                ]
+                if len(block_records) > len(records):
+                    records = block_records
+            elif len(num_tokens) >= 2 * n_ids:
+                # 兼容 2 数值列模式：auf 缺失，ab 和 F_min 存在。
+                num_tokens = num_tokens[: 2 * n_ids]
+                col2 = num_tokens[0:n_ids]
+                col3 = num_tokens[n_ids : 2 * n_ids]
+                block_records = [
+                    (bezeichnung, sid, "", v2, v3)
+                    for sid, v2, v3 in zip(ids, col2, col3)
                 ]
                 if len(block_records) > len(records):
                     records = block_records
@@ -542,9 +608,17 @@ def refine_table1(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["Probe"].astype(str).str.match(SAMPLE_ID_PATTERN)]
     out = out.drop_duplicates(subset=["Probe"], keep="first")
 
-    out["Minimale Steifigkeit auf N/mm"] = pd.to_numeric(out["Minimale Steifigkeit auf N/mm"], errors="coerce")
-    out["Minimale Steifigkeit ab N/mm"] = pd.to_numeric(out["Minimale Steifigkeit ab N/mm"], errors="coerce")
-    out["F_min N"] = pd.to_numeric(out["F_min N"], errors="coerce")
+    out["Minimale Steifigkeit auf N/mm"] = out["Minimale Steifigkeit auf N/mm"].map(to_measure_value)
+    out["Minimale Steifigkeit ab N/mm"] = out["Minimale Steifigkeit ab N/mm"].map(to_measure_value)
+    out["F_min N"] = out["F_min N"].map(to_measure_value)
+
+    # 清理被表头污染的 Bezeichnung，并用主值回填缺失。
+    bad_bez = {"", "Bezeichnung", "Probe", "Minimale", "Steifigkeit", "N/mm", "F_min", "N"}
+    out["Bezeichnung"] = out["Bezeichnung"].astype(str).str.strip()
+    out.loc[out["Bezeichnung"].isin(bad_bez), "Bezeichnung"] = pd.NA
+    non_empty_bez = out["Bezeichnung"].dropna()
+    if not non_empty_bez.empty:
+        out["Bezeichnung"] = out["Bezeichnung"].fillna(non_empty_bez.mode().iloc[0])
 
     out = out.sort_values(by="Probe", key=sort_sample_id_series).reset_index(drop=True)
     return out
